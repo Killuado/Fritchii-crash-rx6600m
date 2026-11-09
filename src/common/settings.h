@@ -411,8 +411,8 @@ struct Values {
                                                   true};
     // The Legend of Zelda: Ocarina of Time's own anti-aliasing network and its sharpening output
     // pass, or the tonemapped image as the game renders it (video_core/oot_network.h).
-    SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
-                                                         "oot_anti_aliasing", Category::Renderer};
+    SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{
+        linkage, OotAntiAliasing::NoSharpening, "oot_anti_aliasing", Category::Renderer};
 
     SwitchableSetting<std::string> post_shader_chain{linkage,
                                                      std::string(),

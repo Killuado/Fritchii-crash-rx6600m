@@ -615,6 +615,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       emission_budget{num_pipeline_workers},
       workers(num_pipeline_workers,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
+      deferred_workers(1, "VkDeferredPipelines", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
     const auto& float_control{device.FloatControlProperties()};
@@ -685,6 +686,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_demote_to_helper_invocation =
             device.IsExtShaderDemoteToHelperInvocationSupported(),
         .support_int64_atomics = device.IsExtShaderAtomicInt64Supported(),
+        .support_float32_atomic_add = device.IsFloat32AtomicAddSupported(),
         .support_shared_int64_atomics = device.IsSharedInt64AtomicsSupported(),
         .support_derivative_control = true,
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
@@ -784,6 +786,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     }
 
     LOG_INFO(Render_Vulkan, "DynamicState setting value: {}", u32(Settings::values.dyna_state.GetValue()));
+    LOG_INFO(Render_Vulkan, "Float32 storage atomic adds: {}",
+             profile.support_float32_atomic_add && profile.support_descriptor_aliasing
+                 ? "native"
+                 : "compare-exchange loop");
 
     dynamic_features = {};
     dynamic_features.driver_id = device.GetDriverID();
@@ -4039,7 +4045,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         ComputeKeep kept;
                         ok = CreateComputePipeline(pools, compute_key, envs.front(), nullptr,
                                                    false, true, keeping ? &kept : nullptr)
-                                 .pipeline != nullptr;
+                                 .pipeline != nullptr ||
+                             !kept.spirv.empty();
                         if (ok && keeping && !kept.spirv.empty()) {
                             std::array<std::vector<u8>, 5> infos;
                             std::array<std::vector<u32>, 5> spirv;
@@ -4202,9 +4209,9 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // found by). Not the exe nor the EDEN_NX2_ switches (2026-11-09, owner: every dev build and
     // every test switch prepared again): whether this build and its switches translate the
     // kept pipelines the same is checked at boot on a sample of them (CheckKeptSample).
-    // NX2KEPT4: the SPIR-V emitter changed under kept modules (zortos293/Lichii#902 clip
-    // distances; #820 noperspective varyings, then its revert), which the sample only sees if it hits one.
-    return fmt::format("{}kept NX2KEPT4 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
+    // NX2KEPT5: the SPIR-V emitter and Shader::Info changed under kept modules (zortos293/Lichii#902
+    // clip distances, native OpAtomicFAddEXT, uses_software_matrix).
+    return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
                        "{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
@@ -4834,11 +4841,14 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
         precompiled_worker_builds.fetch_add(1, std::memory_order_relaxed);
         return BuildShader(device, words);
     };
+    const bool deferred = info->uses_software_matrix && !info->uses_cooperative_matrix &&
+                          device.DefersSoftwareMatrixPipelines();
+    Common::ThreadWorker* const thread_worker{deferred ? &deferred_workers : &workers};
     ComputePipelineCacheEntry entry{
         .pipeline = std::make_unique<ComputePipeline>(
             device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
-            descriptor_buffer_ring, &workers, nullptr, &shader_notify, *info, vk::ShaderModule{},
-            key.unique_hash, std::move(make_module)),
+            descriptor_buffer_ring, thread_worker, nullptr, &shader_notify, *info,
+            vk::ShaderModule{}, key.unique_hash, std::move(make_module), deferred),
         // The live environment answered the same questions, as the translation would have.
         .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                     : std::vector<std::pair<u32, u32>>{},
@@ -6796,7 +6806,15 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         const auto name{fmt::format("Shader {:016x}", key.unique_hash)};
         spv_module.SetObjectNameEXT(name.c_str());
     }
-    Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
+    const bool deferred = program.info.uses_software_matrix &&
+                          !program.info.uses_cooperative_matrix &&
+                          device.DefersSoftwareMatrixPipelines();
+    if (warm && deferred) {
+        return {};
+    }
+    Common::ThreadWorker* const thread_worker{deferred            ? &deferred_workers
+                                              : build_in_parallel ? &workers
+                                                                  : nullptr};
     const Shader::Info info{std::move(program.info)};
     if (!thread_worker) {
         // The driver compiles on this thread. Precache and boot workers would otherwise hold their
@@ -6811,7 +6829,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics,
                 warm ? nullptr : &shader_notify, info,
-                std::move(spv_module), key.unique_hash),
+                std::move(spv_module), key.unique_hash, std::function<vk::ShaderModule()>{},
+                deferred),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
             .mapped_pointers =
